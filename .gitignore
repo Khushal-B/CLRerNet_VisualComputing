@@ -6,3 +6,17 @@ work_dirs
 *.zip
 *.pyc
 .DS_Store
+
+# Ignore massive datasets
+dataset/
+
+# Ignore model weights (these exceed GitHub limits)
+*.pth
+
+# Ignore Python caches
+__pycache__/
+*.pyc
+
+# Ignore local visualization outputs
+*.jpg
+*.png
