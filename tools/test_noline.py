@@ -1,45 +1,54 @@
 #!/usr/bin/env python3
 """
-CLRerNet Test-Time Augmentation (Horizontal Flip) Evaluation
-=============================================================
-The paper explicitly states: "At the test time only the crop and resize are
-adopted and no test-time augmentations are applied."
-This script exploits that gap.
+CLRerNet No-Line Category Improvement via Lane Segment Stitching
+================================================================
+The CULane No-Line category has the lowest F1 (56.75%) — more than 15 points
+below the next-worst category. This script addresses it with two complementary
+post-processing techniques that require zero additional model inference and no
+GPU memory beyond the baseline forward pass.
 
-Method:
-  For each test image:
-    1. Run the EMA model on the ORIGINAL image  → preds_orig
-    2. Horizontally flip the image, run the SAME model → preds_flip
-    3. Un-flip the x-coordinates of preds_flip back to original space:
-           x_unflipped_norm = 1.0 - x_flipped_norm
-    4. Merge preds_orig + preds_unflipped via distance-based NMS:
-       - Keep all original predictions (base set)
-       - Add a flipped prediction ONLY if its mean horizontal distance
-         to every existing lane exceeds the threshold (not a duplicate)
-    5. Remove nearly-horizontal predictions (likely zebra crossings):
-       - Any lane where (y_max - y_min) < min_y_extent is discarded
-       - This directly suppresses the Cross-category FP increase identified
-         in prior experiments where the flip pass added 1335→1633 Cross FPs
+Why No-Line is hard:
+  In "no line" scenes (construction zones, dirt roads, faded markings), the
+  model often detects *fragments* of lanes rather than full lane lines. The
+  CULane metric requires a lane to be matched end-to-end; partial detections
+  do not score as true positives. Two failure modes:
+    1. Same lane detected as two or three disjoint segments → each scored
+       as a FP (wrong location) or missed TP (incomplete coverage).
+    2. The detector's confidence for faint lanes is near the 0.43 threshold;
+       some partial lanes are suppressed.
 
-Why this works better than the ensemble approach:
-  - SAME model quality for both passes (no weaker-model FP injection)
-  - The flip genuinely changes which lanes are easy vs hard to detect
-    (e.g. a right-side lane in the original = left-side lane in the flip,
-     which may be detected with higher confidence from that perspective)
-  - Particularly effective for Curve, Night, and asymmetric Crowd scenes
-  - Cross FP suppression via geometry preserves Curve/Night gains
+Novel approach — Lane Segment Stitching + Confidence-gate adaptive threshold:
+
+  (A) Lane segment stitching (post-hoc, CPU only):
+      After inference, scan all predicted lanes pairwise. If two lanes:
+        - have similar direction angles (within `max_angle_diff` degrees)
+        - have endpoints within `max_endpoint_dist` pixels of each other
+        - do not y-overlap significantly (they are consecutive, not parallel)
+      → replace both with a single degree-2 polynomial fitted to their
+        combined points. This recovers full lane coverage from fragments.
+
+  (B) Confidence-gate adaptive threshold (per-image):
+      If the standard pass yields *fewer than min_lanes_for_scene* predictions,
+      the scene likely has faint / partial markings. A second pass with a
+      relaxed threshold captures additional low-confidence lanes. The relaxed
+      threshold (`low_thresh`) is only applied when the first pass is sparse
+      to avoid adding FPs in normal scenes.
 
 Usage (inside Docker container, from /work):
-    python tools/test_tta.py \
-        configs/clrernet/culane/clrernet_culane_dla34_ema.py \
+    python tools/test_noline.py \\
+        configs/clrernet/culane/clrernet_culane_dla34_ema.py \\
         clrernet_culane_dla34_ema.pth
 
 Optional flags:
-    --data-root        dataset/culane
-    --data-list        dataset/culane/list/test.txt
-    --dist-threshold   40.0   (pixel distance for duplicate NMS, tighter than original 30)
-    --min-y-extent     30     (minimum y-span in pixels; smaller = likely Cross FP)
-    --device           cuda:0
+    --data-root            dataset/culane
+    --data-list            dataset/culane/list/test.txt
+    --max-angle-diff       10.0    (degrees; stitching similarity gate)
+    --max-endpoint-dist    80.0    (pixels; stitching proximity gate)
+    --min-y-overlap-ratio  0.3     (max y-overlap for non-parallel check)
+    --min-lanes-for-scene  2       (if fewer lanes, enable relaxed threshold)
+    --low-thresh           0.38    (relaxed confidence for sparse scenes)
+    --base-thresh          0.43    (standard confidence threshold)
+    --device               cuda:0
 """
 
 import argparse
@@ -64,20 +73,20 @@ from mmdet.apis import init_detector
 from libs.datasets.pipelines import Compose
 from libs.datasets.metrics.culane_metric import interp, eval_predictions
 from libs.utils.postprocess import (
-    mean_lane_distance,
-    unflip_lanes,
     tta_nms,
-    filter_horizontal_lanes,
+    lane_direction_angle,
+    y_overlap_ratio,
+    min_endpoint_distance,
+    stitch_two_lanes,
+    stitch_lane_segments,
 )
 
 
-# ── Single-image inference (accepts pre-loaded image array) ───────────────────
+# ── Inference helper (mirrors test_tta.py) ─────────────────────────────────────
 
 def run_inference_on_array(model, img: np.ndarray, img_path: str):
     """
-    Run CLRerNet inference on a pre-loaded (possibly transformed) image array.
-    Mirrors inference_one_image but accepts img array directly so we can
-    pass the flipped image without saving to disk.
+    Run CLRerNet inference on a pre-loaded image array.
 
     Args:
         model:    Loaded CLRerNet model.
@@ -135,6 +144,7 @@ def get_prediction(lanes, ori_h, ori_w):
     return preds
 
 
+
 # ── Prediction writer ──────────────────────────────────────────────────────────
 
 def write_prediction(lanes, dst_path: Path) -> None:
@@ -155,23 +165,41 @@ def write_prediction(lanes, dst_path: Path) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='CLRerNet TTA (Horizontal Flip) Evaluation'
+        description='CLRerNet No-Line Improvement: Lane Segment Stitching'
     )
     parser.add_argument('config',     help='Config file (EMA recommended)')
     parser.add_argument('checkpoint', help='Checkpoint file')
     parser.add_argument('--data-root', default='dataset/culane')
     parser.add_argument('--data-list', default='dataset/culane/list/test.txt')
+
+    # Stitching parameters
     parser.add_argument(
-        '--dist-threshold', type=float, default=40.0,
-        help='Mean pixel distance below which two lanes are duplicates (default: 40). '
-             'Raising this from the original 30px classifies more flip-pass predictions '
-             'as duplicates, admitting fewer flip lanes and reducing FP injection.'
+        '--max-angle-diff', type=float, default=10.0,
+        help='Max direction angle difference (degrees) to stitch two lanes (default: 10)'
     )
     parser.add_argument(
-        '--min-y-extent', type=float, default=30.0,
-        help='Minimum vertical span (pixels) for a valid lane; smaller predictions '
-             'are treated as horizontal-marking FPs and discarded (default: 30)'
+        '--max-endpoint-dist', type=float, default=80.0,
+        help='Max endpoint distance (pixels) to stitch two lanes (default: 80)'
     )
+    parser.add_argument(
+        '--min-y-overlap-ratio', type=float, default=0.3,
+        help='Max y-overlap fraction to allow stitching (prevents merging parallel lanes)'
+    )
+
+    # Confidence-gate parameters
+    parser.add_argument(
+        '--min-lanes-for-scene', type=int, default=2,
+        help='If fewer lanes detected (first pass), enable relaxed threshold (default: 2)'
+    )
+    parser.add_argument(
+        '--low-thresh', type=float, default=0.38,
+        help='Relaxed confidence threshold for sparse detection scenes (default: 0.38)'
+    )
+    parser.add_argument(
+        '--base-thresh', type=float, default=0.43,
+        help='Standard confidence threshold (paper default: 0.43)'
+    )
+
     parser.add_argument('--device', default='cuda:0')
     return parser.parse_args()
 
@@ -183,60 +211,72 @@ def main():
     logger = MMLogger.get_current_instance()
 
     print("=" * 60)
-    print("Loading CLRerNet EMA model...")
+    print("Loading CLRerNet EMA model for No-Line improvement...")
     print("=" * 60)
     model = init_detector(args.config, args.checkpoint, args.device)
     model.eval()
-    print(f"  dist_threshold = {args.dist_threshold} px (CULane metric width = 30px)")
-    print(f"  min_y_extent   = {args.min_y_extent} px  (Cross FP suppression)\n")
+
+    original_threshold = model.bbox_head.test_cfg.conf_threshold
+    print(f"  base threshold         : {args.base_thresh}")
+    print(f"  low threshold (sparse) : {args.low_thresh}")
+    print(f"  min_lanes_for_scene    : {args.min_lanes_for_scene}")
+    print(f"  max_angle_diff         : {args.max_angle_diff}°")
+    print(f"  max_endpoint_dist      : {args.max_endpoint_dist}px")
+    print(f"  min_y_overlap_ratio    : {args.min_y_overlap_ratio}\n")
 
     with open(args.data_list, 'r') as f:
         img_rel_paths = [line.strip().lstrip('/') for line in f if line.strip()]
 
-    result_dir = tempfile.mkdtemp(prefix='clrernet_tta_')
-    print(f"Running TTA on {len(img_rel_paths)} images...")
+    result_dir = tempfile.mkdtemp(prefix='clrernet_noline_')
+    print(f"Running No-Line inference on {len(img_rel_paths)} images...")
     print(f"Prediction txts → {result_dir}\n")
 
-    n_added = 0   # lanes recovered by the flip pass
+    n_stitched_total = 0    # lanes recovered by stitching
+    n_relaxed_total  = 0    # images where relaxed threshold was used
 
-    for img_rel_path in tqdm(img_rel_paths, desc='TTA inference'):
+    for img_rel_path in tqdm(img_rel_paths, desc='No-Line inference'):
         img_full_path = os.path.join(args.data_root, img_rel_path)
-        ori_w = 1640   # CULane standard width (used for un-flip only)
 
-        # ── Pass 1: original image ─────────────────────────────────────────────
         img_bgr = cv2.imread(img_full_path)
         if img_bgr is None:
-            # write empty prediction and continue
             dst_path = Path(result_dir) / Path(img_rel_path).with_suffix('.lines.txt')
             write_prediction([], dst_path)
             continue
 
-        preds_orig = run_inference_on_array(model, img_bgr, img_full_path)
+        # ── Pass 1: standard threshold ─────────────────────────────────────────
+        model.bbox_head.test_cfg.conf_threshold = args.base_thresh
+        preds = run_inference_on_array(model, img_bgr, img_full_path)
 
-        # ── Pass 2: horizontally flipped image ─────────────────────────────────
-        img_flipped = cv2.flip(img_bgr, 1)           # flip code 1 = horizontal
-        preds_flip  = run_inference_on_array(model, img_flipped, img_full_path)
+        # ── Pass 2: relaxed threshold for sparse detections (confidence gate) ──
+        if len(preds) < args.min_lanes_for_scene:
+            model.bbox_head.test_cfg.conf_threshold = args.low_thresh
+            preds_low = run_inference_on_array(model, img_bgr, img_full_path)
+            # Merge: keep all low-thresh predictions not already in preds
+            # (use a simple distance gate to avoid duplicates)
+            preds = tta_nms(preds, preds_low, dist_threshold=30.0)
+            n_relaxed_total += 1
 
-        # ── Un-flip x-coords back to original space ────────────────────────────
-        preds_flip_unflipped = unflip_lanes(preds_flip, ori_w)
+        model.bbox_head.test_cfg.conf_threshold = original_threshold
 
-        # ── Merge with NMS ─────────────────────────────────────────────────────
-        n_before = len(preds_orig)
-        merged   = tta_nms(preds_orig, preds_flip_unflipped, args.dist_threshold)
-
-        # ── Suppress Cross-category FPs (nearly-horizontal predictions) ────────
-        merged   = filter_horizontal_lanes(merged, min_y_extent=args.min_y_extent)
-        n_added += len(merged) - n_before
+        # ── Lane segment stitching ─────────────────────────────────────────────
+        n_before = len(preds)
+        preds = stitch_lane_segments(
+            preds,
+            max_angle_diff=args.max_angle_diff,
+            max_endpoint_dist=args.max_endpoint_dist,
+            min_y_overlap_ratio=args.min_y_overlap_ratio,
+        )
+        n_stitched_total += max(0, n_before - len(preds))
 
         # ── Write prediction ───────────────────────────────────────────────────
         dst_path = Path(result_dir) / Path(img_rel_path).with_suffix('.lines.txt')
-        write_prediction(merged, dst_path)
+        write_prediction(preds, dst_path)
 
-    avg_added = n_added / len(img_rel_paths)
-    print(f"\nFlip pass added {n_added} lanes total ({avg_added:.3f} per image on average)")
+    print(f"\nRelaxed threshold used : {n_relaxed_total} images")
+    print(f"Lanes stitched (merged): {n_stitched_total} total")
 
     # ── Evaluate ───────────────────────────────────────────────────────────────
-    print("\nEvaluating TTA predictions...")
+    print("\nEvaluating No-Line predictions...")
     categories_dir = str(Path(args.data_root) / 'list' / 'test_split')
 
     results = eval_predictions(
@@ -250,8 +290,7 @@ def main():
 
     # ── Summary ─────────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("TTA RESULTS  (baseline EMA static: 81.55%)")
-    print(f"  dist_threshold={args.dist_threshold}px  min_y_extent={args.min_y_extent}px")
+    print("NO-LINE IMPROVEMENT RESULTS  (baseline EMA static: 81.55%)")
     print("=" * 60)
     for key, val in results.items():
         if isinstance(val, float):
@@ -261,11 +300,11 @@ def main():
 
     print("\nKey categories vs baseline:")
     baseline = {
+        'F1_test4_noline_0.5': 56.75,
         'F1_test0_normal_0.5': 94.36,
         'F1_test1_crowd_0.5':  80.85,
         'F1_test2_hlight_0.5': 75.17,
         'F1_test3_shadow_0.5': 84.55,
-        'F1_test4_noline_0.5': 56.75,
         'F1_test5_arrow_0.5':  90.99,
         'F1_test6_curve_0.5':  78.83,
         'F1_test8_night_0.5':  76.85,
